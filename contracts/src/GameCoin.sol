@@ -20,8 +20,8 @@ contract GameCoin is ERC20 {
         _burn(from, amount);
     }
 
-    function transfer(address to, uint256 amount) public override returns (bool){
-        return super.transfer(to, amount);
+    function transferFrom(address from,address to, uint256 amount) public override returns (bool){
+        return super.transferFrom(from,to, amount);
         
     }
 

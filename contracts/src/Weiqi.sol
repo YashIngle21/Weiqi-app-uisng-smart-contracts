@@ -1,126 +1,330 @@
-// Layout of Contract:
-// version
-// imports
-// errors
-// interfaces, libraries, contracts
-// Type declarations
-// State variables
-// Events
-// Modifiers
-// Functions
-
-// Layout of Functions:
-// constructor
-// receive function (if exists)
-// fallback function (if exists)
-// external
-// public
-// internal
-// private
-// view & pure functions
-
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
-
 
 /**
 * @title Weiqi
 * @author @YashIngle21
-* @notice This contract is the main contract for the Weiqi game
+* @notice This contract is the main contract for the Weiqi/Connect4 game
 */
-
 
 import {Ownable} from "@openzeppelin/contracts/access/Ownable.sol";
 import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
 import {ERC20} from "@openzeppelin/contracts/token/ERC20/ERC20.sol";
-
+import {ECDSA} from "@openzeppelin/contracts/utils/cryptography/ECDSA.sol";
 import {GameCoin} from "./GameCoin.sol";
 
-
-
 contract Weiqi is Ownable, ReentrancyGuard {
+    using ECDSA for bytes32;
 
+    // --- Errors ---
     error MinDepositNotMet(uint256 depositedAmount);
-    error InsufficientBalance(address  player, uint256 requestedAmount);
+    error InsufficientBalance(address player, uint256 balance, uint256 required);
+    error InsufficientAllowance(address player, uint256 allowance, uint256 required);
     error CashOutFailed();
+    error InvalidSignature(address recovered, address expected);
+    error GameNotActive();
+    error PotOverspent();
+    error Unauthorized();
+    error TimeoutNotReached();
+    error DisputeAlreadyActive();
+    error InvalidResolutionState();
 
+    // --- Constants ---
+    uint64 public constant EXCHANGE_RATE = 1000; // 1000 GC per 1 ETH
+    uint64 public constant MIN_TOKEN_DEPOSIT = 0.01 ether; 
+    uint256 public constant DEV_FEE_PERCENT = 10; // 10% fee
 
-
-    uint256 public constant EXCHANGE_RATE = 1000; // 1000 weiqi tokens per 1 ETH
-    uint256 public constant MIN_DEPOSIT = 0.01 ether; // Minimum deposit amount
-
-    mapping(address => uint256) public gameCoinBalances;
-
+    // --- State Variables ---
     GameCoin public gameCoin;
 
-    event GameCoinBought(address indexed buyer, uint256 amount);
+    enum GameStatus { NON_EXISTENT, ACTIVE, CLOSED, DISPUTE }
 
+    struct GameInfo {
+        GameStatus status;
+        address player1;
+        address player2;
+        uint256 totalLocked; // The total buffer (Deposit * 2)
+        uint256 startTime;
+        uint256 endedTime;
+        uint256 timeoutDeadline;   // NEW: Tracks when the timeout can be claimed
+        address timeoutInitiator;  // NEW: Tracks who started the dispute
+    }
+
+    mapping(uint256 => GameInfo) public games;
+    mapping(address => uint256[]) public playerGames;
+
+    event GameCoinBought(address indexed buyer, uint256 amount);
+    event GameStarted(uint256 indexed gameId, address p1, address p2, uint256 totalLocked);
+    event GameSettled(uint256 indexed gameId, address winner, uint256 payout);
+    event TimeoutInitiated(uint256 indexed gameId, address indexed initiator, uint256 claimableAt);
+    event TimeoutClaimed(uint256 indexed gameId, address indexed winner, uint256 payout);
+    event TimeoutResolved(uint256 indexed gameId, address indexed resolver);
+
+    modifier OnlyNonInitiator(uint256 _gameId){
+
+        if( msg.sender == games[_gameId].timeoutInitiator){
+            revert Unauthorized();
+        }
+        _;
+    }
 
     constructor(address initialOwner) Ownable(initialOwner) {
         gameCoin = new GameCoin(address(this));
     }
 
-
-    // Game Coin Purchase and Cash Out
-
-    /*
-    * @notice Buys game coins for the caller
-    * @dev Emits a GameCoinBought event
-    * @param msg.value The amount of ETH to buy game coins for
-     */
+    // =============================================================
+    // 1. TOKEN LOGIC (Buying/Selling Chips)
+    // =============================================================
 
     function buyToken() external payable {
-        if(msg.value <= MIN_DEPOSIT) {
+        if (msg.value < MIN_TOKEN_DEPOSIT) {
             revert MinDepositNotMet(msg.value);
         }
-        gameCoin.mint(msg.sender, msg.value * EXCHANGE_RATE);
-        emit GameCoinBought(msg.sender, msg.value * EXCHANGE_RATE);
-
+        uint256 amountToMint = msg.value * EXCHANGE_RATE;
+        gameCoin.mint(msg.sender, amountToMint);
+        emit GameCoinBought(msg.sender, amountToMint);
     }
 
-    /**
-    * @notice Cashes out game coins for the caller
-    * @dev Emits a GameCoinBought event
-    * @param amount The amount of game coins to cash out
-    */
-
-    function cashOut(uint256 amount) external payable {
-        if(gameCoin.balanceOf(msg.sender) < amount){
-            revert InsufficientBalance(msg.sender, amount);
+    function cashOut(uint256 amount) external nonReentrant {
+        if (gameCoin.balanceOf(msg.sender) < amount) {
+            revert InsufficientBalance(msg.sender, gameCoin.balanceOf(msg.sender), amount);
         }
+        
+        // 1. Burn the GC
         gameCoin.burn(msg.sender, amount);
+        
+        // 2. Calculate ETH
         uint256 amountInEth = amount / EXCHANGE_RATE;
+        
+        // 3. Send ETH
         (bool success,) = msg.sender.call{value: amountInEth}("");
-        if(!success){
+        if (!success) {
             revert CashOutFailed();
         }
     }
 
-    // Game Functions( HappyPath)
+    // =============================================================
+    // 2. GAME LOGIC (The State Channel)
+    // =============================================================
 
-    function startGame( address opponentAddress, uint256 depositAmount, uint80 gameId, bytes calldata opponentSignature) external{
-        if(depositAmount < gameCoinBalances[msg.sender]){
-            revert InsufficientBalance(msg.sender, depositAmount);
-        }
+    /**
+     * @notice Starts a game by locking funds from both players
+     * @param players [Player1, Player2]
+     * @param _depositAmount The amount EACH player must lock (e.g. 100 GC)
+     * @param _gameId A random number generated by frontend to prevent replay attacks and also serves as game ID
+     * @param _signatures [Player1Sig, Player2Sig] signing the INTENT to play
+     */
+    function startGame(
+        address[2] calldata players, 
+        uint256 _depositAmount, 
+        uint256 _gameId,
+        bytes[2] calldata _signatures
+    ) external nonReentrant returns (uint256) {
+        
+        // 1. Verify Balances
+        if (gameCoin.balanceOf(players[0]) < _depositAmount) revert InsufficientBalance(players[0], gameCoin.balanceOf(players[0]), _depositAmount);
+        if (gameCoin.balanceOf(players[1]) < _depositAmount) revert InsufficientBalance(players[1], gameCoin.balanceOf(players[1]), _depositAmount);
 
+        // 2. Reconstruct the Hash (Security Fix)
+        // We hash the specific details of THIS game request
+        bytes32 messageHash = keccak256(abi.encodePacked(
+            address(this), // Prevent using signature on other contracts
+            players[0], 
+            players[1], 
+            _depositAmount, 
+            _gameId
+        ));
+        
+        bytes32 ethSignedMessageHash = messageHash.toEthSignedMessageHash();
 
+        // 3. Verify Signatures match the Hash
+        if (ethSignedMessageHash.recover(_signatures[0]) != players[0]) revert InvalidSignature(ethSignedMessageHash.recover(_signatures[0]), players[0]);
+        if (ethSignedMessageHash.recover(_signatures[1]) != players[1]) revert InvalidSignature(ethSignedMessageHash.recover(_signatures[1]), players[1]);
 
+        // 4. Lock Funds (Transfer to Contract)
+        // Note: Players must have called gameCoin.approve() on frontend first
+        gameCoin.transferFrom(players[0], address(this), _depositAmount);
+        gameCoin.transferFrom(players[1], address(this), _depositAmount);
+
+        // 5. Create Session
+        
+        games[_gameId] = GameInfo({
+            status: GameStatus.ACTIVE,
+            player1: players[0],
+            player2: players[1],
+            totalLocked: _depositAmount * 2,
+            startTime: block.timestamp,
+            endedTime: 0
+        });
+
+        playerGames[players[0]].push(_gameId);
+        playerGames[players[1]].push(_gameId);
+
+        emit GameStarted(_gameId, players[0], players[1], _depositAmount * 2);
+        return _gameId;
     }
 
-    function settleGame(uint80 gameId, address winnerAddress, uint256 totalPotSpent, bytes[] calldata signatures) external {}
+    /**
+     * @notice Settles a game based on a final signed result
+     * @param _gameId The ID generated in startGame
+     * @param _winner The address who won
+     * @param _totalPotSpentByPlayer The ACTUAL amount spent in the game (e.g., 20 GC)
+     * @param _signatures [Player1Sig, Player2Sig] agreeing to this result
+     */
+    function settleGame(
+        uint256 _gameId, 
+        address _winner, 
+        uint256[2] calldata  _totalPotSpentByPlayer, 
+        bytes[2] calldata _signatures
+    ) external nonReentrant {
+        
+        GameInfo storage game = games[_gameId];
+
+        // 1. Sanity Checks
+        if (game.status != GameStatus.ACTIVE) revert GameNotActive();
+
+        // 2. Reconstruct Hash (Security Fix)
+        // We hash the FINAL RESULT
+        bytes32 messageHash = keccak256(abi.encodePacked(
+            _gameId,
+            _winner,
+            _totalPotSpentByPlayer
+        ));
+        
+        bytes32 ethSignedMessageHash = messageHash.toEthSignedMessageHash();
+
+        // 3. Verify Signatures
+        if (ethSignedMessageHash.recover(_signatures[0]) != game.player1) revert InvalidSignature(ethSignedMessageHash.recover(_signatures[0]), game.player1);
+        if (ethSignedMessageHash.recover(_signatures[1]) != game.player2) revert InvalidSignature(ethSignedMessageHash.recover(_signatures[1]), game.player2);
+
+        // 4. Update State
+        game.status = GameStatus.CLOSED;
+        game.endedTime = block.timestamp;
+        game.totalLocked += _totalPotSpentByPlayer[0] + _totalPotSpentByPlayer[1];
+
+        // 5. Calculate Payouts (The Refund Logic)
+        
+        // Fee Calculation
+        uint256 devFee = (game.totalLocked * DEV_FEE_PERCENT) / 100;
+        uint256 winnerPrize = game.totalLocked - devFee;
 
 
-    // Dispute Resolution Functions
+        // 6. Transfers
+        // A. Pay Dev Fee
+        gameCoin.transfer(owner(), devFee);
+        // B. Pay the Winner their Prize (Prize is added to their refund)
+        gameCoin.transfer(_winner, winnerPrize);
+
+        emit GameSettled(_gameId, _winner, winnerPrize);
+    }
+
+    // =============================================================
+    // 3. DISPUTE LOGIC 
+    // =============================================================
+    
+    /**
+     * @notice Initiates from the frontend after a player hasn't responded.
+     * Starts a 3-minute timer for the opponent to respond.
+     */
+    function initiateTimeout(uint256 _gameId,address _opponentAddresss, uint256 _turnNumber, bytes calldata _lastStateSign ) external nonReentrant {
+        GameInfo storage game = games[_gameId];
+        
+        // 1. Sanity Checks
+        if (game.status != GameStatus.ACTIVE) revert GameNotActive();
+        if (msg.sender != game.player1 && msg.sender != game.player2) revert Unauthorized();
+        
+        // 2. State Verification (To be customized based on your game's data structure)
+        // TODO: Decode `lastSignedState` (e.g., turn number, board state, whose turn it is next).
+        // You must verify the signature of `lastSignedState` to ensure it was the opponent's 
+        // turn and that they are the ones stalling.
+
+        bytes32 messageHash = keccak256(abi.encode(
+            _gameId,
+            _turnNumber,
+            _opponentAddresss
+        ));
+
+        bytes32 ethSignedMessageHash = messageHash.toEthSignedMessageHash();
+        if (ethSignedMessageHash.recover(_lastStateSign) != msg.sender) revert InvalidSignature(ethSignedMessageHash.recover(_lastStateSign), msg.sender);
 
 
-    function initiateTimeout(uint80 gameId, address lastsignedSatate) external {}
+        
+        // 3. Update State
+        game.status = GameStatus.DISPUTE;
+        game.timeoutInitiator = msg.sender;
+        game.timeoutDeadline = block.timestamp + 3 minutes; // 3 min timer as requested
+        
+        emit TimeoutInitiated(_gameId, msg.sender, game.timeoutDeadline);
+    }
 
-    function claimTimeout(uint80 gameId) external {}
+    /**
+     * @notice Claims the pot if the opponent failed to respond within the 3-minute window.
+     */
+    function claimTimeout(uint256 _gameId) external nonReentrant {
+        GameInfo storage game = games[_gameId];
+        
+        // 1. Sanity Checks
+        if (game.status != GameStatus.DISPUTE) revert GameNotActive();
+        if (msg.sender != game.timeoutInitiator) revert Unauthorized();
+        if (block.timestamp < game.timeoutDeadline) revert TimeoutNotReached();
+        
+        // 2. Update State
+        game.status = GameStatus.CLOSED;
+        game.endedTime = block.timestamp;
+        
+        // 3. Calculate Payouts
+        uint256 devFee = (game.totalLocked * DEV_FEE_PERCENT) / 100;
+        uint256 winnerPrize = game.totalLocked - devFee;
+        
+        // 4. Transfers
+        // Pay Dev Fee
+        gameCoin.transfer(owner(), devFee);
+        // Transfer all remaining pot to the waiting player
+        gameCoin.transfer(msg.sender, winnerPrize);
+        
+        // Emit events
+        emit GameSettled(_gameId, msg.sender, winnerPrize);
+        emit TimeoutClaimed(_gameId, msg.sender, winnerPrize);
+    }
 
-    function _resolveDispute(uint80 gameId, bytes calldata newestSignedState) internal{}
+    /**
+     * @notice Allows the accused player to defend themselves by providing a newer valid state,
+     * or by proving they have made a move, thereby canceling the timeout.
+     * @param _gameId The ID of the game in dispute.
+     * @param _lastStateSign A signed payload proving the game has progressed past the timeout claim.
+     */
+    function resolveTimeout(uint256 _gameId,uint256 _turnNumber, address _opponentAddresss,bytes calldata _lastStateSign) external nonReentrant OnlyNonInitiator(_gameId){
+        GameInfo storage game = games[_gameId];
+        
+        // 1. Sanity Checks
+        if (game.status != GameStatus.DISPUTE) revert GameNotActive();
+
+        // 2. State Verification (Crucial Step)
+        // TODO: Decode `_newerSignedState` and verify the signatures.
+        // You MUST check that the nonce/turn number in `_newerSignedState` is strictly 
+        // GREATER than the nonce used in `initiateTimeout`. 
+        // If it isn't valid, revert InvalidResolutionState();
+
+        bytes32 messageHash = keccak256(abi.encode(
+            _gameId +10 ,
+            _turnNumber,
+            _opponentAddresss
+        ));
+
+        bytes32 ethSignedMessageHash = messageHash.toEthSignedMessageHash();
+        if (ethSignedMessageHash.recover(_lastStateSign) != msg.sender) revert InvalidResolutionState(ethSignedMessageHash.recover(_lastStateSign), msg.sender);
 
 
-    receive() external payable {}
 
-    fallback() external payable {}
+        // 3. Update State (Cancel the dispute)
+        game.status = GameStatus.ACTIVE;
+        game.timeoutInitiator = address(0);
+        game.timeoutDeadline = 0;
+
+        emit TimeoutResolved(_gameId, msg.sender);
+    }
+
+    receive() external payable { }
+
+    fallback() external payable { }
 }
